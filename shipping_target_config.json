@@ -1,0 +1,44 @@
+{
+  "_说明": "批量同步发货服务 — 目标值配置文件",
+  "_用法": "运行 batch_shipping_sync.sh 前修改此文件的 target 部分，脚本会读取并比对每个商品的发货服务字段",
+  "_可选发货时间": [
+    "当日发",
+    "24小时发货",
+    "48小时发货",
+    "72小时发货",
+    "7天发货",
+    "10天发货",
+    "15天发货",
+    "20天发货",
+    "30天发货",
+    "45天发货"
+  ],
+
+  "target": {
+    "row1": {
+      "min_qty": "1",
+      "max_qty": "2",
+      "ship_time": "48小时发货",
+      "ship_time_code": "ssbxsfh",
+      "description": "第1行：1~2件 承诺48小时发货"
+    },
+    "row2": {
+      "min_qty": "3",
+      "max_qty": "",
+      "max_qty_label": "库存上限（留空表示不限）",
+      "ship_time": "72小时发货",
+      "ship_time_code": "essebsfh",
+      "description": "第2行：3件以上 承诺72小时发货"
+    }
+  },
+
+  "skip_criteria": {
+    "_说明": "当商品当前发货服务与以下条件完全匹配时，跳过修改（标记为 SKIP）",
+    "row1_ship_time": "48小时发货",
+    "row2_ship_time": "72小时发货",
+    "row1_min_qty": "1",
+    "row1_max_qty": "2",
+    "row2_min_qty": "3",
+    "row2_max_qty": ""
+  }
+}

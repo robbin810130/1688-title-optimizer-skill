@@ -1,0 +1,8 @@
+# Runtime artifacts
+logs/
+screenshots/
+__pycache__/
+*.pyc
+
+# OS/editor
+.DS_Store
