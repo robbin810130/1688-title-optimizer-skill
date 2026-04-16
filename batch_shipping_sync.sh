@@ -28,6 +28,54 @@ MODIFIED=0
 SKIPPED=0
 FAILED=0
 CURRENT_PAGE=1
+NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
+WAIT_TIMEOUT="${WAIT_TIMEOUT:-900}"
+FILTER_KEYWORD="${FILTER_KEYWORD:-}"
+SKU_LIST="${SKU_LIST:-}"
+SKU_FILE="${SKU_FILE:-}"
+SKU_TARGETS_JSON="[]"
+PROCESSED_FILE=""
+LAST_HANDLED_COUNT=0
+
+usage() {
+    cat <<'EOF'
+用法：
+  ./batch_shipping_sync.sh --sku-list SKU0001,SKU0002
+  ./batch_shipping_sync.sh --sku-file ./sku.txt
+  ./batch_shipping_sync.sh --keyword 防晒
+  ./batch_shipping_sync.sh --sku-list SKU0001 --keyword 防晒
+
+说明：
+  - 必须提供 --sku-list / --sku-file / --keyword 之一，不允许全量处理所有商品。
+  - SKU 清单支持 SKU 或 offerId，逗号分隔或文件逐行填写。
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --sku-list)
+            SKU_LIST="${2:-}"
+            shift 2
+            ;;
+        --sku-file)
+            SKU_FILE="${2:-}"
+            shift 2
+            ;;
+        --keyword)
+            FILTER_KEYWORD="${2:-}"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "❌ 未知参数: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
 
 # ── 从配置文件读取目标值 ────────────────────────────────────────────────────
 
@@ -55,6 +103,42 @@ if [[ -z "$ROW1_SHIP" || -z "$ROW2_SHIP" ]]; then
     exit 1
 fi
 
+if [[ -z "$FILTER_KEYWORD" && -z "$SKU_LIST" && -z "$SKU_FILE" ]]; then
+    echo "❌ 必须提供筛选条件：--sku-list / --sku-file / --keyword（至少一个）"
+    usage
+    exit 1
+fi
+
+if [[ -n "$SKU_FILE" && ! -f "$SKU_FILE" ]]; then
+    echo "❌ SKU 文件不存在：$SKU_FILE"
+    exit 1
+fi
+
+SKU_TARGETS_JSON=$(python3 - "$SKU_LIST" "$SKU_FILE" <<'PY'
+import json
+import re
+import sys
+
+sku_list = sys.argv[1] if len(sys.argv) > 1 else ""
+sku_file = sys.argv[2] if len(sys.argv) > 2 else ""
+tokens = []
+if sku_list:
+    tokens.extend([x.strip() for x in sku_list.split(",") if x.strip()])
+if sku_file:
+    with open(sku_file, "r", encoding="utf-8-sig") as f:
+        for line in f:
+            s = line.strip()
+            if s and not s.startswith("#"):
+                tokens.append(s)
+
+def norm(v: str) -> str:
+    return re.sub(r"\s+", "", v or "").strip().upper()
+
+uniq = sorted({norm(x) for x in tokens if norm(x)})
+print(json.dumps(uniq, ensure_ascii=False))
+PY
+)
+
 log_config() {
     echo ""
     echo "══════════════════════════════════════════════════"
@@ -63,6 +147,8 @@ log_config() {
     echo "──────────────────────────────────────────────────"
     echo "  第1行：${ROW1_MIN}~${ROW1_MAX}件 → ${ROW1_SHIP}"
     echo "  第2行：${ROW2_MIN}件+ → ${ROW2_SHIP}"
+    echo "  关键词筛选：${FILTER_KEYWORD:-<未设置>}"
+    echo "  SKU清单数量：$(echo "$SKU_TARGETS_JSON" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))' 2>/dev/null)"
     echo "══════════════════════════════════════════════════"
 }
 
@@ -87,23 +173,41 @@ log() {
 
 bw_evaluate() {
     local script="$1"
+    local payload
+    payload=$(python3 - "$script" <<'PY'
+import json, sys
+print(json.dumps({"script": sys.argv[1]}, ensure_ascii=False))
+PY
+)
     curl -s -X POST "${BW_BASE}/evaluate" \
         -H 'Content-Type: application/json' \
-        -d "{\"script\": \"${script}\"}"
+        -d "$payload"
 }
 
 bw_navigate() {
     local url="$1"
+    local payload
+    payload=$(python3 - "$url" <<'PY'
+import json, sys
+print(json.dumps({"url": sys.argv[1], "wait_until": "load", "timeout": 30}, ensure_ascii=False))
+PY
+)
     curl -s -X POST "${BW_BASE}/navigate" \
         -H 'Content-Type: application/json' \
-        -d "{\"url\": \"${url}\", \"wait_until\": \"load\", \"timeout\": 30}"
+        -d "$payload"
 }
 
 bw_screenshot() {
     local path="$1"
+    local payload
+    payload=$(python3 - "$path" <<'PY'
+import json, sys
+print(json.dumps({"path": sys.argv[1]}, ensure_ascii=False))
+PY
+)
     curl -s -X POST "${BW_BASE}/screenshot" \
         -H 'Content-Type: application/json' \
-        -d "{\"path\": \"${path}\"}"
+        -d "$payload"
 }
 
 # JS 字符串安全转义（用于嵌在 JSON 中）
@@ -121,27 +225,180 @@ check_captcha() {
 
 wait_for_captcha_clear() {
     log WARN "⚠️  检测到验证码！请在 BrowserWing 浏览器窗口中手动完成验证..."
-    echo ""
-    echo "═══════════════════════════════════════════════════"
-    echo "  🛡️  验证码已触发，请在浏览器窗口中手动处理"
-    echo "  处理完成后按 [Enter] 继续..."
-    echo "═══════════════════════════════════════════════════"
-    read -r
-    # 二次确认
-    local status
-    status=$(check_captcha)
-    if [[ "$status" == "CLEAN" ]]; then
-        log OK "✅ 验证码已清除，继续执行"
+    local start_ts now status
+    start_ts=$(date +%s)
+    if [[ "$NON_INTERACTIVE" != "1" && -t 0 ]]; then
+        echo ""
+        echo "═══════════════════════════════════════════════════"
+        echo "  🛡️  验证码已触发，请在浏览器窗口中手动处理"
+        echo "  处理完成后按 [Enter] 继续..."
+        echo "═══════════════════════════════════════════════════"
+        read -r
     else
-        log WARN "仍然检测到验证码元素：${status}，继续尝试..."
+        log WARN "当前为非交互模式：自动轮询验证码状态"
     fi
+    while true; do
+        status=$(check_captcha)
+        if [[ "$status" == "CLEAN" ]]; then
+            log OK "✅ 验证码已清除，继续执行"
+            return 0
+        fi
+        now=$(date +%s)
+        if (( now - start_ts > WAIT_TIMEOUT )); then
+            log ERROR "⏱️ 验证码等待超时（${WAIT_TIMEOUT}s）：${status}"
+            return 1
+        fi
+        sleep 5
+    done
+}
+
+wait_for_login_ready() {
+    log WARN "🔐 检测到未登录，请在 BrowserWing 浏览器中完成登录"
+    local start_ts now page_text
+    start_ts=$(date +%s)
+    if [[ "$NON_INTERACTIVE" != "1" && -t 0 ]]; then
+        echo ""
+        echo "═══════════════════════════════════════════════════"
+        echo "  🔐 请在 BrowserWing 控制的浏览器中登录 1688"
+        echo "  登录完成后按 [Enter] 继续..."
+        echo "═══════════════════════════════════════════════════"
+        read -r
+    else
+        log WARN "当前为非交互模式：自动轮询登录状态"
+    fi
+    while true; do
+        page_text=$(bw_evaluate '() => { return document.body ? document.body.innerText.substring(0, 200) : "NO_BODY"; }' \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('result',''))" 2>/dev/null)
+        if [[ "$page_text" != *"登录"* && "$page_text" != *"请登录"* && "$page_text" != "NO_BODY" ]]; then
+            log OK "✅ 登录状态已恢复"
+            return 0
+        fi
+        now=$(date +%s)
+        if (( now - start_ts > WAIT_TIMEOUT )); then
+            log ERROR "⏱️ 登录等待超时（${WAIT_TIMEOUT}s）"
+            return 1
+        fi
+        sleep 5
+    done
 }
 
 # ── 商品列表提取 ─────────────────────────────────────────────────────────────
 
 extract_page_products() {
-    bw_evaluate '() => { const items = []; document.querySelectorAll("a").forEach(a => { if (a.innerText.trim() === "修改详情" && a.href.includes("offerId=")) { const m = a.href.match(/offerId=(\d+)/); if (m) items.push(m[1]); } }); return JSON.stringify(items); }' \
-        | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin).get('data',{}).get('result','[]')))" 2>/dev/null
+    local keyword_override="${1:-$FILTER_KEYWORD}"
+    local raw
+    local keyword_esc
+    keyword_esc=$(js_escape "$keyword_override")
+    raw=$(bw_evaluate "() => { const targets = ${SKU_TARGETS_JSON}; const keyword = '${keyword_esc}'.trim(); const norm = (s) => (s || '').replace(/\\s+/g, '').toUpperCase(); const seen = {}; const items = []; const rows = Array.from(document.querySelectorAll('tbody tr')).filter(r => (r.innerText || '').trim() && (r.innerText || '').indexOf('暂无') < 0); rows.forEach(row => { const text = (row.innerText || '').replace(/\\s+/g, ' ').trim(); let offerId = ''; let sku = ''; const links = row.querySelectorAll('a'); for (const a of links) { const href = a.href || ''; let m = href.match(/offerId=(\\d+)/) || href.match(/[?&]id=(\\d+)/) || href.match(/offer\\/(\\d+)/); if (m && m[1]) { offerId = m[1]; break; } } const idMatch = text.match(/\\[ID\\]\\s*(\\d+)/) || text.match(/ID[：:]\\s*(\\d+)/); if (!offerId && idMatch) offerId = idMatch[1]; const skuMatch = text.match(/\\[货号\\]\\s*([^\\s]+)/) || text.match(/货号[：:]\\s*([^\\s]+)/) || text.match(/(SKU[0-9A-Za-z_-]+)/i); if (skuMatch && skuMatch[1]) sku = skuMatch[1]; const lines = (row.innerText || '').split('\\n').map(x => x.trim()).filter(Boolean); const title = lines.length ? lines[0] : text.substring(0, 80); if (!offerId) return; const offerKey = norm(offerId); const skuKey = norm(sku); if (targets.length > 0 && targets.indexOf(offerKey) < 0 && targets.indexOf(skuKey) < 0) return; if (keyword && text.indexOf(keyword) < 0 && title.indexOf(keyword) < 0 && sku.indexOf(keyword) < 0) return; if (seen[offerId]) return; seen[offerId] = true; items.push({offerId: offerId, sku: sku, title: title.substring(0, 80)}); }); return JSON.stringify(items); }")
+    python3 - "$raw" <<'PY' 2>/dev/null
+import json
+import sys
+
+raw = sys.argv[1] if len(sys.argv) > 1 else ""
+try:
+    d = json.loads(raw)
+except Exception:
+    print("[]")
+    raise SystemExit
+
+r = d.get("data", {}).get("result", "[]")
+if isinstance(r, str):
+    try:
+        arr = json.loads(r)
+    except Exception:
+        arr = []
+elif isinstance(r, list):
+    arr = r
+else:
+    arr = []
+
+print(json.dumps(arr, ensure_ascii=False))
+PY
+}
+
+search_list_by_keyword() {
+    local keyword="$1"
+    local keyword_esc
+    keyword_esc=$(js_escape "$keyword")
+    bw_evaluate "() => { const kw='${keyword_esc}'; const input=document.querySelector('#keyword'); if(!input) return 'INPUT_NOT_FOUND'; const nativeSetter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set; nativeSetter.call(input, kw); input.dispatchEvent(new Event('input',{bubbles:true})); input.dispatchEvent(new Event('change',{bubbles:true})); input.dispatchEvent(new Event('compositionend',{bubbles:true})); const btn=document.querySelector('button.simple-search__submit-btn'); if(btn){ btn.click(); return 'SEARCH_DONE'; } return 'BTN_NOT_FOUND'; }" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('result','FAILED'))" 2>/dev/null
+}
+
+build_search_terms() {
+    python3 - "$FILTER_KEYWORD" "$SKU_TARGETS_JSON" <<'PY'
+import json, sys
+keyword = (sys.argv[1] or "").strip()
+targets_json = sys.argv[2] if len(sys.argv) > 2 else "[]"
+try:
+    targets = json.loads(targets_json)
+except Exception:
+    targets = []
+terms = []
+if keyword:
+    terms.append(keyword)
+for t in targets:
+    s = str(t).strip()
+    if s:
+        terms.append(s)
+seen = set()
+for t in terms:
+    if t not in seen:
+        seen.add(t)
+        print(t)
+PY
+}
+
+already_processed_offer() {
+    local offer_id="$1"
+    [[ -n "$PROCESSED_FILE" && -f "$PROCESSED_FILE" ]] || return 1
+    grep -Fxq "$offer_id" "$PROCESSED_FILE"
+}
+
+mark_offer_processed() {
+    local offer_id="$1"
+    [[ -n "$PROCESSED_FILE" ]] || return 0
+    echo "$offer_id" >> "$PROCESSED_FILE"
+}
+
+process_products_json() {
+    local products_json="$1"
+    local matched_count
+    local handled_in_batch=0
+    LAST_HANDLED_COUNT=0
+    matched_count=$(echo "$products_json" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null)
+    if [[ -z "$matched_count" || "$matched_count" == "0" ]]; then
+        LAST_HANDLED_COUNT=0
+        return 0
+    fi
+
+    log INFO "📋 本次命中 ${matched_count} 个商品"
+    local tmp_products
+    tmp_products=$(mktemp)
+    echo "$products_json" | python3 -c "import sys,json; [print(x.get('offerId','')) for x in json.load(sys.stdin) if isinstance(x,dict)]" 2>/dev/null > "$tmp_products"
+
+    local idx=0
+    while IFS= read -r offer_id; do
+        if [[ -z "$offer_id" ]]; then continue; fi
+        if already_processed_offer "$offer_id"; then
+            log INFO "⏭️  跳过重复商品 ${offer_id}"
+            continue
+        fi
+        idx=$((idx + 1))
+        TOTAL=$((TOTAL + 1))
+        handled_in_batch=$((handled_in_batch + 1))
+        log INFO "[$(printf '%02d' $idx)/$matched_count] 处理 ${offer_id}"
+        process_product "$offer_id"
+        mark_offer_processed "$offer_id"
+
+        local captcha
+        captcha=$(check_captcha)
+        if [[ "$captcha" != "CLEAN" ]]; then
+            wait_for_captcha_clear || true
+        fi
+        sleep 2
+    done < "$tmp_products"
+    rm -f "$tmp_products"
+    LAST_HANDLED_COUNT=$handled_in_batch
 }
 
 # ── 翻页 ─────────────────────────────────────────────────────────────────────
@@ -177,10 +434,14 @@ scroll_to_shipping_section() {
 }
 
 extract_shipping_values() {
-    # 提取发货服务表格当前值
-    # 返回 JSON: {"row0_select": "48小时发货", "row1_select": "72小时发货", "row0_inputs": [...], "row1_inputs": [...]}
-    bw_evaluate '() => { const tables = document.querySelectorAll("table"); let st = null; for (const t of tables) { if (t.innerText.includes("发货时间") && t.innerText.includes("购买数量")) { st = t; break; } } if (!st) return JSON.stringify({error: "table_not_found"}); const rows = st.querySelectorAll("tbody tr"); const r = {row0: {}, row1: {}}; if (rows[0]) { const s = rows[0].querySelector(".ant-select"); r.row0.select = s ? s.innerText.trim().split("\\n")[0] : ""; const inps = rows[0].querySelectorAll("input.ant-input-number-input"); r.row0.inputs = Array.from(inps).map(i => ({value: i.value, disabled: i.disabled})); } if (rows[1]) { const s = rows[1].querySelector(".ant-select"); r.row1.select = s ? s.innerText.trim().split("\\n")[0] : ""; const inps = rows[1].querySelectorAll("input.ant-input-number-input"); r.row1.inputs = Array.from(inps).map(i => ({value: i.value, disabled: i.disabled})); } return JSON.stringify(r); }' \
-        | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin).get('data',{}).get('result','{}')))" 2>/dev/null
+    # 提取发货服务表格当前值（兼容 ant-select / next-select）
+    bw_evaluate '() => { const tables = document.querySelectorAll("table"); let st = null; for (const t of tables) { const tx=(t.innerText||""); if (tx.includes("发货时间") && tx.includes("购买数量")) { st = t; break; } } if (!st) return JSON.stringify({error: "table_not_found"}); const rows = st.querySelectorAll("tbody tr"); const pickShip = (row) => { const text=(row.innerText||"").replace(/\\s+/g," "); const m=text.match(/(\\d+小时发货|\\d+天发货|当日发货|次日发货|\\d+日发货)/); if (m) return m[1]; const ant=row.querySelector(".ant-select .ant-select-selection-item, .ant-select-selector"); if (ant) return (ant.innerText||"").trim(); const nxt=row.querySelector(".next-select .next-select-inner, .next-select-value"); if (nxt) return (nxt.innerText||"").trim(); return ""; }; const pickInputs=(row)=>{ const inps=Array.from(row.querySelectorAll("input.ant-input-number-input,input")).filter(i=>{ if (!i || i.type==="hidden" || i.type==="search") return false; const cls=(i.className||""); const v=(i.value||"").trim(); const ph=(i.placeholder||"").trim(); if (cls.indexOf("ant-input-number-input")>=0) return true; return !!v || !!ph; }); return inps.map(i=>({value:(i.value||"").trim(), placeholder:(i.placeholder||"").trim(), disabled:!!i.disabled})); }; const r={row0:{select:"",inputs:[]},row1:{select:"",inputs:[]}}; if (rows[0]) { r.row0.select=pickShip(rows[0]); r.row0.inputs=pickInputs(rows[0]); } if (rows[1]) { r.row1.select=pickShip(rows[1]); r.row1.inputs=pickInputs(rows[1]); } return JSON.stringify(r); }' \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('data',{}).get('result',{}); print(r if isinstance(r,str) else json.dumps(r,ensure_ascii=False))" 2>/dev/null
+}
+
+extract_shipping_ranges_by_text() {
+    bw_evaluate '() => { const tables = document.querySelectorAll("table"); let st = null; for (const t of tables) { const tx=(t.innerText||""); if (tx.includes("发货时间") && tx.includes("购买数量")) { st = t; break; } } if (!st) return JSON.stringify({error: "table_not_found"}); const rows = st.querySelectorAll("tbody tr"); const parse=(txt)=>{ const t=(txt||"").replace(/\\s+/g," "); let min="",max=""; let m=t.match(/(\\d+)\\s*[~\\-]\\s*(\\d+)\\s*[件个]?/); if (m){ min=m[1]; max=m[2]; } let m2=t.match(/(\\d+)\\s*[件个]\\s*以上/); if (m2){ if(!min) min=m2[1]; } if (!m2) { const m3=t.match(/>=\\s*(\\d+)/); if (m3 && !min) min=m3[1]; } return {min:min,max:max,text:t}; }; const r0=rows[0]?parse(rows[0].innerText):{min:"",max:"",text:""}; const r1=rows[1]?parse(rows[1].innerText):{min:"",max:"",text:""}; return JSON.stringify({row0:r0,row1:r1}); }' \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('data',{}).get('result',{}); print(r if isinstance(r,str) else json.dumps(r,ensure_ascii=False))" 2>/dev/null
 }
 
 needs_modification() {
@@ -192,6 +453,13 @@ needs_modification() {
     row0_min=$(echo "$values_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('row0',{}).get('inputs',[{},{}])[0].get('value',''))" 2>/dev/null)
     row0_max=$(echo "$values_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('row0',{}).get('inputs',[{},{}])[1].get('value',''))" 2>/dev/null)
     row1_min=$(echo "$values_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('row1',{}).get('inputs',[{},{}])[0].get('value',''))" 2>/dev/null)
+    if [[ -z "$row0_min" || -z "$row0_max" || -z "$row1_min" ]]; then
+        local ranges_json
+        ranges_json=$(extract_shipping_ranges_by_text)
+        [[ -z "$row0_min" ]] && row0_min=$(echo "$ranges_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('row0',{}).get('min',''))" 2>/dev/null)
+        [[ -z "$row0_max" ]] && row0_max=$(echo "$ranges_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('row0',{}).get('max',''))" 2>/dev/null)
+        [[ -z "$row1_min" ]] && row1_min=$(echo "$ranges_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('row1',{}).get('min',''))" 2>/dev/null)
+    fi
 
     log INFO "当前值 → 第1行: ${row0_min}~${row0_max}件 ${row0_ship} | 第2行: ${row1_min}件+ ${row1_ship}"
 
@@ -214,42 +482,100 @@ modify_shipping() {
         *)    row_index=1 ;;
     esac
 
-    # 第一步：用 BrowserWing click API 打开 Ant Design 下拉框
-    # 关键：必须设置 wait_visible=false，因为 select 元素可能在滚动区域内不可见
-    local css_selector="table tbody tr:nth-child($((row_index + 1))) .ant-select"
-    curl -s -X POST "${BW_BASE}/click" \
-        -H 'Content-Type: application/json' \
-        -d "{\"identifier\": \"${css_selector}\", \"wait_visible\": false, \"timeout\": 5}" > /dev/null
-
-    sleep 2
-
-    # 第二步：检查下拉框是否打开
-    local dropdown_check
-    dropdown_check=$(bw_evaluate '() => { const opts = document.querySelectorAll(".ant-select-item-option"); if (opts.length === 0) return "NO_OPTIONS"; return "HAS_OPTIONS:" + opts.length; }' \
-        | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('result','NO_OPTIONS'))" 2>/dev/null)
-
-    if [[ "$dropdown_check" == "NO_OPTIONS" ]]; then
-        log ERROR "  ❌ 下拉框未打开"
-        return 1
-    fi
-
-    log INFO "  下拉框已打开（${dropdown_check}）"
-
-    # 第三步：用 JS evaluate 在下拉选项中点击目标值
+    # 先打开当前行发货时间下拉，再点击目标值（兼容 ant / next）
     local target_esc
     target_esc=$(js_escape "$target_value")
     local select_result
-    select_result=$(bw_evaluate "() => { const opts = document.querySelectorAll('.ant-select-item-option'); for (const opt of opts) { const content = opt.querySelector('.ant-select-item-option-content'); if (content && content.innerText.trim() === '${target_esc}') { opt.click(); return 'selected'; } } return 'NOT_FOUND'; }" \
+    select_result=$(bw_evaluate "() => { const target='${target_esc}'; const norm=(s)=>(s||'').replace(/\\s+/g,'').trim().toLowerCase(); const targetNorm=norm(target); const alias=(t)=>{ const arr=[targetNorm]; if (targetNorm.includes('72小时')) arr.push('3天发货','72小时发货','72h发货','三天发货'); if (targetNorm.includes('48小时')) arr.push('2天发货','48小时发货','48h发货','两天发货'); return arr; }; const candidates=alias(target); const matches=(txt)=>{ const t=norm(txt); if(!t) return false; return candidates.some(c=>t===norm(c) || t.includes(norm(c)) || norm(c).includes(t)); }; const tables=Array.from(document.querySelectorAll('table')); const st=tables.find(t=>{const tx=(t.innerText||''); return tx.includes('发货时间')&&tx.includes('购买数量');}); if(!st) return 'TABLE_NOT_FOUND'; const rows=st.querySelectorAll('tbody tr'); const row=rows[${row_index}]; if(!row) return 'ROW_NOT_FOUND'; if (matches(row.innerText||'')) return 'already'; const primary=row.querySelector('td:nth-child(3) .ant-select') || row.querySelector('td:nth-child(3) .next-select') || row.querySelector('.ant-select') || row.querySelector('.next-select'); if(!primary) return 'SELECT_NOT_FOUND'; const selector=primary.querySelector('.ant-select-selector,.next-select-inner') || primary; selector.scrollIntoView({behavior:'auto',block:'center'}); ['mousedown','mouseup','click'].forEach(ev=>selector.dispatchEvent(new MouseEvent(ev,{bubbles:true,cancelable:true,view:window}))); const arrow=primary.querySelector('.ant-select-arrow,.next-icon,.next-select-trigger'); if(arrow){ ['mousedown','mouseup','click'].forEach(ev=>arrow.dispatchEvent(new MouseEvent(ev,{bubbles:true,cancelable:true,view:window}))); } const allOpts=()=>Array.from(document.querySelectorAll('.ant-select-item-option,.ant-select-dropdown .ant-select-item-option-content,.next-menu-item,.next-select-menu .next-menu-item,.next-select-menu li,.next-overlay-inner li')); const tryClick=()=>{ const opts=allOpts(); for(const el of opts){ const tx=(el.innerText||'').trim(); if(matches(tx)){ el.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true,view:window})); el.click(); return true; } } return false; }; if (tryClick()) return 'selected'; const scrollers=Array.from(document.querySelectorAll('.ant-select-dropdown .rc-virtual-list-holder,.ant-select-dropdown .rc-virtual-list,.ant-select-dropdown,.next-overlay-wrapper .next-menu,.next-overlay-wrapper,[class*=dropdown],[class*=menu]')); for(const box of scrollers){ for(let i=0;i<8;i++){ try{ box.scrollTop = (box.scrollTop||0) + 180; }catch(e){} if(tryClick()) return 'selected'; } } return 'NOT_FOUND'; }" \
         | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('result','FAILED'))" 2>/dev/null)
 
-    sleep 1.5
-    if [[ "$select_result" == "selected" ]]; then
+    sleep 1.2
+    if [[ "$select_result" == "selected" || "$select_result" == "already" ]]; then
         log OK "  ✅ 已选择「${target_value}」"
         return 0
     else
         log ERROR "  ❌ 选择「${target_value}」失败：${select_result}"
         return 1
     fi
+}
+
+set_input_value_js() {
+    local row_index="$1"
+    local input_index="$2"
+    local value="$3"
+    local value_esc
+    value_esc=$(js_escape "$value")
+    cat <<EOF
+() => {
+  const table = Array.from(document.querySelectorAll("table")).find(t => t.innerText.includes("发货时间") && t.innerText.includes("购买数量"));
+  if (!table) return "TABLE_NOT_FOUND";
+  const rows = table.querySelectorAll("tbody tr");
+  const row = rows[${row_index}];
+  if (!row) return "ROW_NOT_FOUND";
+  const inputs = Array.from(row.querySelectorAll("input.ant-input-number-input,input")).filter(i => {
+    if (!i || i.type === "hidden" || i.type === "search") return false;
+    const cls = i.className || "";
+    if (cls.indexOf("ant-input-number-input") >= 0) return true;
+    return (i.value || "").trim() !== "" || (i.placeholder || "").trim() !== "";
+  });
+  const inp = inputs[${input_index}] || null;
+  if (!inp) return "INPUT_NOT_FOUND";
+  const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+  try { inp.removeAttribute("readonly"); } catch(e) {}
+  inp.focus();
+  nativeSetter.call(inp, "${value_esc}");
+  inp.dispatchEvent(new Event("input", {bubbles: true}));
+  inp.dispatchEvent(new Event("change", {bubbles: true}));
+  inp.dispatchEvent(new Event("blur", {bubbles: true}));
+  return "INPUT_SET:${row_index}:${input_index}:${value_esc}";
+}
+EOF
+}
+
+set_quantity_values() {
+    local write_failed=0
+    local r
+
+    # row0: min / max
+    r=$(bw_evaluate "$(set_input_value_js 0 0 "$ROW1_MIN")" | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('result','FAILED'))" 2>/dev/null)
+    [[ "$r" == INPUT_SET* ]] || write_failed=1
+    sleep 0.6
+    r=$(bw_evaluate "$(set_input_value_js 0 1 "$ROW1_MAX")" | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('result','FAILED'))" 2>/dev/null)
+    [[ "$r" == INPUT_SET* ]] || write_failed=1
+    sleep 0.6
+
+    # row1: min
+    r=$(bw_evaluate "$(set_input_value_js 1 0 "$ROW2_MIN")" | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('result','FAILED'))" 2>/dev/null)
+    [[ "$r" == INPUT_SET* ]] || write_failed=1
+    sleep 0.6
+
+    if [[ $write_failed -eq 1 ]]; then
+        log WARN "  ⚠️ 部分数量区间输入框未成功写入，进入结果校验"
+    fi
+
+    # 回读校验
+    local values_json row0_min row0_max row1_min
+    values_json=$(extract_shipping_values)
+    row0_min=$(echo "$values_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('row0',{}).get('inputs',[{},{}])[0].get('value',''))" 2>/dev/null)
+    row0_max=$(echo "$values_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('row0',{}).get('inputs',[{},{}])[1].get('value',''))" 2>/dev/null)
+    row1_min=$(echo "$values_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('row1',{}).get('inputs',[{},{}])[0].get('value',''))" 2>/dev/null)
+
+    if [[ "$row0_min" != "$ROW1_MIN" || "$row0_max" != "$ROW1_MAX" || "$row1_min" != "$ROW2_MIN" ]]; then
+        local ranges_json t_row0_min t_row0_max t_row1_min
+        ranges_json=$(extract_shipping_ranges_by_text)
+        t_row0_min=$(echo "$ranges_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('row0',{}).get('min',''))" 2>/dev/null)
+        t_row0_max=$(echo "$ranges_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('row0',{}).get('max',''))" 2>/dev/null)
+        t_row1_min=$(echo "$ranges_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('row1',{}).get('min',''))" 2>/dev/null)
+        if [[ "$t_row0_min" == "$ROW1_MIN" && "$t_row0_max" == "$ROW1_MAX" && "$t_row1_min" == "$ROW2_MIN" ]]; then
+            log WARN "  ⚠️ 输入框读值为空，按规则文本校验数量区间已匹配：${ROW1_MIN}~${ROW1_MAX} / ${ROW2_MIN}+"
+            return 0
+        fi
+        log ERROR "  ❌ 数量区间校验失败：期望(${ROW1_MIN},${ROW1_MAX},${ROW2_MIN}) 实际(${row0_min},${row0_max},${row1_min}) / 文本(${t_row0_min},${t_row0_max},${t_row1_min})"
+        return 1
+    fi
+
+    log OK "  ✅ 数量区间已对齐：${ROW1_MIN}~${ROW1_MAX} / ${ROW2_MIN}+"
+    return 0
 }
 
 submit_changes() {
@@ -302,18 +628,26 @@ process_product() {
     bw_navigate "$edit_url" > /dev/null
     sleep 6
 
-    # 2. 验证码检测
+    # 2. 登录态校验（进入编辑页后、执行自动化前）
+    local page_text
+    page_text=$(bw_evaluate '() => { return document.body ? document.body.innerText.substring(0, 200) : "NO_BODY"; }' \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('result',''))" 2>/dev/null)
+    if [[ "$page_text" == *"登录"* || "$page_text" == *"请登录"* || "$page_text" == "NO_BODY" ]]; then
+        wait_for_login_ready || { FAILED=$((FAILED + 1)); return; }
+    fi
+
+    # 3. 验证码检测
     local captcha
     captcha=$(check_captcha)
     if [[ "$captcha" != "CLEAN" ]]; then
         wait_for_captcha_clear
     fi
 
-    # 3. 滚动到发货服务区域
+    # 4. 滚动到发货服务区域
     scroll_to_shipping_section
     sleep 1
 
-    # 4. 提取当前值
+    # 5. 提取当前值
     local values
     values=$(extract_shipping_values)
     if [[ -z "$values" || "$values" == *"error"* || "$values" == *"not_found"* ]]; then
@@ -339,6 +673,10 @@ process_product() {
 
     # 7. 修改发货服务
     local modify_failed=0
+
+    # 7.0 先确保数量区间与配置一致
+    set_quantity_values || modify_failed=1
+    sleep 0.8
 
     # 检查第1行是否需要修改
     local row0_ship
@@ -416,97 +754,61 @@ main() {
     page_text=$(bw_evaluate '() => { return document.body.innerText.substring(0, 200); }' \
         | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('result',''))" 2>/dev/null)
     if [[ "$page_text" == *"登录"* || "$page_text" == *"请登录"* ]]; then
-        log ERROR "❌ 未登录 1688！请先在 BrowserWing 浏览器中登录。"
-        echo ""
-        echo "═══════════════════════════════════════════════════"
-        echo "  🔐 请在 BrowserWing 控制的浏览器中登录 1688"
-        echo "  登录完成后按 [Enter] 继续..."
-        echo "═══════════════════════════════════════════════════"
-        read -r
+        wait_for_login_ready || exit 1
     fi
 
-    # 主循环：逐页遍历
-    while true; do
-        local page_display
-        page_display=$(get_page_info)
+    PROCESSED_FILE=$(mktemp)
+    trap 'rm -f "$PROCESSED_FILE"' EXIT
+
+    local terms_file
+    terms_file=$(mktemp)
+    build_search_terms > "$terms_file"
+    local term_count
+    term_count=$(wc -l < "$terms_file" | tr -d ' ')
+    log INFO "将按 ${term_count} 个检索词逐个执行（先搜索再自动化）"
+
+    while IFS= read -r search_term; do
+        [[ -n "$search_term" ]] || continue
         log INFO "────────────────────────────────────────"
-        log INFO "📄 当前页：${page_display}"
+        log INFO "🔎 检索词：${search_term}"
 
-        # 提取当前页商品
-        local products_json
-        products_json=$(extract_page_products)
-        local product_count
-        product_count=$(echo "$products_json" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null)
-
-        if [[ -z "$product_count" || "$product_count" == "0" ]]; then
-            log WARN "当前页未提取到商品，尝试等待..."
-            sleep 3
-            products_json=$(extract_page_products)
-            product_count=$(echo "$products_json" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null)
-            if [[ -z "$product_count" || "$product_count" == "0" ]]; then
-                log ERROR "仍然无法提取商品，跳过此页"
-                break
-            fi
-        fi
-
-        log INFO "📋 本页 ${product_count} 个商品"
-        TOTAL=$((TOTAL + product_count))
-
-        # 逐个处理商品（用临时文件 + 进程替换避免 subshell 变量丢失问题）
-        local tmp_products
-        tmp_products=$(mktemp)
-        echo "$products_json" | python3 -c "import sys,json; [print(x) for x in json.load(sys.stdin)]" 2>/dev/null > "$tmp_products"
-
-        local idx=0
-        while IFS= read -r offer_id; do
-            if [[ -z "$offer_id" ]]; then continue; fi
-            idx=$((idx + 1))
-            log INFO "[$(printf '%02d' $idx)/$product_count] 处理 ${offer_id}"
-
-            process_product "$offer_id"
-
-            # 验证码检测（每个商品处理后）
-            captcha=$(check_captcha)
-            if [[ "$captcha" != "CLEAN" ]]; then
-                wait_for_captcha_clear
-            fi
-
-            # 返回列表页（如果不在列表页）
-            local current_url
-            current_url=$(bw_evaluate '() => return location.href;' \
-                | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('result',''))" 2>/dev/null)
-            if [[ "$current_url" != *"/offer/manage.htm"* ]]; then
-                log INFO "返回商品列表..."
-                bw_navigate "$LIST_URL" > /dev/null
-                sleep 4
-            fi
-
-            # 操作间隔，避免触发风控
-            sleep 2
-        done < "$tmp_products"
-        rm -f "$tmp_products"
-
-        # 检查是否有下一页
-        local next_status
-        next_status=$(has_next_page)
-        if [[ "$next_status" == "NO_NEXT" ]]; then
-            log OK "已到达最后一页"
-            break
-        fi
-
-        # 点击下一页
-        log INFO "翻到下一页..."
-        click_next_page > /dev/null
+        bw_navigate "$LIST_URL" > /dev/null
         sleep 4
 
-        # 翻页后验证码检测
         captcha=$(check_captcha)
         if [[ "$captcha" != "CLEAN" ]]; then
-            wait_for_captcha_clear
+            wait_for_captcha_clear || true
+        fi
+        page_text=$(bw_evaluate '() => { return document.body ? document.body.innerText.substring(0, 200) : "NO_BODY"; }' \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('result',''))" 2>/dev/null)
+        if [[ "$page_text" == *"登录"* || "$page_text" == *"请登录"* || "$page_text" == "NO_BODY" ]]; then
+            wait_for_login_ready || exit 1
         fi
 
-        CURRENT_PAGE=$((CURRENT_PAGE + 1))
-    done
+        local search_status
+        search_status=$(search_list_by_keyword "$search_term")
+        if [[ "$search_status" != "SEARCH_DONE" ]]; then
+            log ERROR "检索失败（${search_term}）：${search_status}"
+            FAILED=$((FAILED + 1))
+            continue
+        fi
+        sleep 4
+
+        captcha=$(check_captcha)
+        if [[ "$captcha" != "CLEAN" ]]; then
+            wait_for_captcha_clear || true
+        fi
+
+        local products_json
+        products_json=$(extract_page_products "$search_term")
+        process_products_json "$products_json"
+        if [[ "$LAST_HANDLED_COUNT" == "0" ]]; then
+            log WARN "检索词未命中商品：${search_term}"
+        else
+            log OK "检索词处理完成：${search_term}（处理 ${LAST_HANDLED_COUNT} 条）"
+        fi
+    done < "$terms_file"
+    rm -f "$terms_file"
 
     # 输出汇总
     echo ""
