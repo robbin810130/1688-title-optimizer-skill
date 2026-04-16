@@ -40,6 +40,32 @@ python3 -m py_compile ./exit_waodingzhi.py
 python3 -m py_compile ./batch_official_customize_enable.py
 ```
 
+4. BrowserWing 服务复用策略（硬性）：
+- 先探测，后启动；探测通过就直接复用，禁止重复拉起。
+- 仅当探测失败时，才允许静默后台启动。
+
+复用探测命令：
+```bash
+curl -s --connect-timeout 2 http://localhost:8080/api/v1/executor/help | grep -q '"navigate"'
+```
+
+若探测成功：
+- 直接进入业务流程。
+- 不执行 `pkill`、不重启 BrowserWing。
+
+若探测失败（才允许启动）：
+```bash
+cd /Users/robbin/Codex/1688Skill
+nohup browserwing --config /Users/robbin/Codex/1688Skill/config.toml >/tmp/browserwing.out 2>&1 &
+sleep 2
+curl -s --connect-timeout 3 http://localhost:8080/api/v1/executor/help
+```
+
+说明：
+- 上述启动为后台静默启动（无前台阻塞）。
+- 目标是尽量避免每次执行时再弹 BrowserWing 管理页面（`http://127.0.0.1:xxxxx/`）。
+- 若仍偶发弹页，保持“复用优先”即可显著降低出现频次。
+
 ## 三、功能选择与输入约束
 
 ### 功能1：AI 标题优化（`batch_title_optimizer.py`）
@@ -137,15 +163,18 @@ python3 -m py_compile ./batch_official_customize_enable.py
 3. 功能1/2误跑全店：
 - 处理：无 SKU/筛选条件时直接退出并提示。
 
-4. 功能2 下拉项“看得到但点不到”：
+4. 每次都重启 BrowserWing 导致弹管理页：
+- 处理：严格执行“先探测复用，失败才静默后台启动”。
+
+5. 功能2 下拉项“看得到但点不到”：
 - 原因：下拉层过渡态/虚拟列表/不可见过滤误判。
 - 处理：使用 `mousedown + click` 打开；选项匹配不依赖可见性；必要时滚动下拉容器再匹配。
 
-5. 功能4 第二类目开始漏选四项：
+6. 功能4 第二类目开始漏选四项：
 - 原因：残留弹层/类目切换后作用域漂移。
 - 处理：每类目都重新打开当前类目的包装定制下拉，完成后核验弹窗中是否包含四项再保存。
 
-6. `SAVE_UNKNOWN`：
+7. `SAVE_UNKNOWN`：
 - 解释：不一定失败，可能已成功保存。
 - 处理：以页面实际状态为准（是否可继续下个类目、是否出现报错）。
 

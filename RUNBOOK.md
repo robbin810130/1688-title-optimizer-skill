@@ -24,29 +24,53 @@ curl -s --connect-timeout 3 http://localhost:8080/api/v1/executor/help | head
 - `help` 接口可返回 JSON。
 - BrowserWing 控制的浏览器中已登录 1688 商家后台。
 
-## 2. 启动 BrowserWing（如未运行）
+## 2. BrowserWing 复用与静默启动（强制）
+
+先探测是否已有服务，探测成功就复用，不要重启：
 
 ```bash
-browserwing --port 8080
+curl -s --connect-timeout 2 http://localhost:8080/api/v1/executor/help | grep -q '"navigate"'
+```
+
+探测通过：
+- 直接执行业务脚本。
+- 禁止 `pkill` / 禁止重复 `browserwing --port 8080`。
+
+探测失败（才允许启动）：
+```bash
+cd /Users/robbin/Codex/1688Skill
+nohup browserwing --config /Users/robbin/Codex/1688Skill/config.toml >/tmp/browserwing.out 2>&1 &
+sleep 2
+curl -s --connect-timeout 3 http://localhost:8080/api/v1/executor/help | head
 ```
 
 说明：
 
-- 建议单独终端常驻运行 BrowserWing。
-- 若端口异常，先结束旧进程再重启 BrowserWing。
+- 采用后台静默启动，避免前台阻塞。
+- 执行策略是“复用优先”，减少每次执行弹出 BrowserWing 管理页面（`http://127.0.0.1:xxxxx/`）的概率。
+- 只有服务不可用时才启动；不要每次任务都拉起新实例。
 
 ## 3. 试跑（建议先做）
 
 先用小轮次验证当前环境：
 
 ```bash
-MAX_ROUNDS=1 MAX_CONSECUTIVE_ERRORS=20 /Users/robbin/.agents/skills/1688-title-optimizer/batch_official_customize_enable.sh
+cd /path/to/1688-title-optimizer-skill
+MAX_ROUNDS=1 MAX_CONSECUTIVE_ERRORS=20 ./batch_official_customize_enable.sh
 ```
 
 ## 4. 整轮执行
 
 ```bash
-MAX_ROUNDS=200 MAX_CONSECUTIVE_ERRORS=20 /Users/robbin/.agents/skills/1688-title-optimizer/batch_official_customize_enable.sh
+cd /path/to/1688-title-optimizer-skill
+MAX_ROUNDS=200 MAX_CONSECUTIVE_ERRORS=20 ./batch_official_customize_enable.sh
+```
+
+非交互运行（推荐给其他 agent）：
+
+```bash
+cd /path/to/1688-title-optimizer-skill
+NON_INTERACTIVE=1 MAX_ROUNDS=200 MAX_CONSECUTIVE_ERRORS=20 ./batch_official_customize_enable.sh
 ```
 
 ## 5. 运行中观察点
@@ -61,13 +85,13 @@ MAX_ROUNDS=200 MAX_CONSECUTIVE_ERRORS=20 /Users/robbin/.agents/skills/1688-title
 日志路径：
 
 ```text
-/Users/robbin/.agents/skills/1688-title-optimizer/logs/official_customize_{timestamp}.log
+./logs/official_customize_{timestamp}.log
 ```
 
 截图路径：
 
 ```text
-/Users/robbin/.agents/skills/1688-title-optimizer/screenshots/official_customize/
+./screenshots/official_customize/
 ```
 
 ## 6. 异常处理
@@ -103,8 +127,9 @@ pkill -f batch_official_customize_enable.py
 ## 8. 发布前最小检查
 
 ```bash
-python3 -m py_compile /Users/robbin/.agents/skills/1688-title-optimizer/batch_official_customize_enable.py
-bash -n /Users/robbin/.agents/skills/1688-title-optimizer/batch_official_customize_enable.sh
+cd /path/to/1688-title-optimizer-skill
+python3 -m py_compile ./batch_official_customize_enable.py
+bash -n ./batch_official_customize_enable.sh
 ```
 
 ## 9. 验收建议
